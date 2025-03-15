@@ -8,7 +8,7 @@ A graph sparsifier based on an approximated PageRank algorithm.
 """
 repository = "https://github.com/TimeExceed/graph-sparsifier"
 readme = "README.md"
-categories = ["algorithms", "graph"]
+categories = ["algorithms"]
 keywords = ["graph", "sparsifier"]
 
 [[bench]]
