@@ -2,6 +2,14 @@
 name = "graph-sparsifier"
 version = "0.1.0"
 edition = "2024"
+license-file = "LICENSE"
+description = """
+A graph sparsifier based on an approximated PageRank algorithm.
+"""
+repository = "https://github.com/TimeExceed/graph-sparsifier"
+readme = "README.md"
+categories = ["algorithms", "graph"]
+keywords = ["graph", "sparsifier"]
 
 [[bench]]
 name = "benches"
