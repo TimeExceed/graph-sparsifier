@@ -2,6 +2,7 @@ use super::*;
 use algograph::graph::*;
 use keyed_priority_queue::KeyedPriorityQueue;
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, HashMap, HashSet},
     iter::Iterator,
 };
@@ -242,6 +243,13 @@ where
 {
     graph: &'a G,
     cur_graph: AdaptiveOwnedGraph<'a, G>,
+    last_cached: RefCell<Cached>,
+}
+
+#[derive(Default)]
+struct Cached {
+    cached_vertex_size: usize,
+    start_candidates: Vec<VertexId>,
 }
 
 enum AdaptiveOwnedGraph<'a, G>
@@ -261,30 +269,55 @@ where
         Self {
             graph,
             cur_graph: AdaptiveOwnedGraph::Borrow(ShadowedSubgraph::new(graph)),
+            last_cached: RefCell::new(Cached::default()),
         }
     }
 
-    fn start_vertex<GG>(&self, apr: &ApproxPageRank<'_, GG>) -> VertexId
-    where
-        GG: QueryableGraph,
-    {
-        assert!(self.cur_graph.vertex_size() > 0);
-        let start: HashMap<_, _, ahash::RandomState> = {
-            let n = self.cur_graph.vertex_size() as f64;
-            self.cur_graph
-                .iter_vertices()
-                .map(|v| (v, 1.0 / n))
-                .collect()
+    fn start_vertex(
+        &self,
+    ) -> (
+        VertexId,
+        Option<ApproxPageRank<'_, AdaptiveOwnedGraph<'_, G>>>,
+    ) {
+        assert!(
+            self.cur_graph.vertex_size() > 0,
+            "# of vertex: {}",
+            self.cur_graph.vertex_size()
+        );
+        let mut cached = self.last_cached.borrow_mut();
+        let should_calibrate = cached.start_candidates.is_empty()
+            || self.cur_graph.vertex_size() * 3 < cached.cached_vertex_size * 2;
+        let apr = if should_calibrate {
+            assert!(self.cur_graph.vertex_size() > 0);
+            let start: HashMap<_, _, ahash::RandomState> = {
+                let n = self.cur_graph.vertex_size() as f64;
+                self.cur_graph
+                    .iter_vertices()
+                    .map(|v| (v, 1.0 / n))
+                    .collect()
+            };
+            let apr = new_apr(&self.cur_graph);
+            let result = apr.calc(&start);
+            cached.start_candidates.clear();
+            for v in self.cur_graph.iter_vertices() {
+                cached.start_candidates.push(v);
+            }
+            cached
+                .start_candidates
+                .sort_by_key(|v| FullOrdFloat(*result.page_rank.get(v).unwrap()));
+            cached.cached_vertex_size = self.cur_graph.vertex_size();
+            Some(apr)
+        } else {
+            None
         };
-        let result = apr.calc(&start);
-        self.cur_graph
-            .iter_vertices()
-            .max_by(|a, b| {
-                let rank_a = result.page_rank().get(a).unwrap();
-                let rank_b = result.page_rank().get(b).unwrap();
-                rank_a.partial_cmp(rank_b).unwrap()
-            })
-            .unwrap()
+        let mut start = None;
+        while let Some(v) = cached.start_candidates.pop() {
+            if self.cur_graph.contains_vertex(&v) {
+                start = Some(v);
+                break;
+            }
+        }
+        (start.unwrap(), apr)
     }
 
     fn expander<GG>(
@@ -375,6 +408,27 @@ where
     }
 }
 
+fn new_apr<G>(g: &G) -> ApproxPageRank<'_, G>
+where
+    G: QueryableGraph,
+{
+    // On the one hand, let us detect expanders whose diameter is $n$,
+    // i.e., arbitrary two vertices in the expander are connected within $n$ edges.
+    // That is to say, `damping`'s $n$-th square should be small enough.
+    // For example, if we want expanders whose diameter is 4, and we
+    // consider 0.1 as small enough, then we will have `damping` must >=0.56.
+    //
+    // On the other hand, small `damping`` causes big differences between
+    // results of the iterative method and those of the approximated method.
+    // We examined it over our unit tests, we found the following looks good.
+    let damping = 0.9;
+    let vol_total = g.edge_size() * 2;
+    let gamma = harmonic_number(vol_total);
+    let epsilon = 1.0 / (2.0 * gamma);
+    let cfg = Config { damping, epsilon };
+    ApproxPageRank::new(g, &cfg)
+}
+
 impl<'a, G> Iterator for Sparsifier<'a, G>
 where
     G: QueryableGraph + VertexShrinkableGraph + EdgeShrinkableGraph + DirectedOrNot + Clone,
@@ -390,28 +444,17 @@ where
             let expander: HashSet<_, ahash::RandomState> = [u].into_iter().collect();
             return Some(self.postprocess(&expander));
         }
-        let g = &self.cur_graph;
-        // On the one hand, let us detect expanders whose diameter is $n$,
-        // i.e., arbitrary two vertices in the expander are connected within $n$ edges.
-        // That is to say, `damping`'s $n$-th square should be small enough.
-        // For example, if we want expanders whose diameter is 4, and we
-        // consider 0.1 as small enough, then we will have `damping` must >=0.56.
-        //
-        // On the other hand, small `damping`` causes big differences between
-        // results of the iterative method and those of the approximated method.
-        // We examined it over our unit tests, we found the following looks good.
-        let damping = 0.9;
-        let vol_total = g.edge_size() * 2;
-        let expander: HashSet<_, ahash::RandomState> = if vol_total == 0 {
-            let v = g.iter_vertices().next().unwrap();
+        let expander: HashSet<_, ahash::RandomState> = if self.cur_graph.edge_size() == 0 {
+            let v = self.cur_graph.iter_vertices().next().unwrap();
             [v].into_iter().collect()
         } else {
-            let gamma = harmonic_number(vol_total);
-            let epsilon = 1.0 / (2.0 * gamma);
-            let cfg = Config { damping, epsilon };
-            let apr = ApproxPageRank::new(g, &cfg);
-            let start_vertex = self.start_vertex(&apr);
-            self.expander(&apr, start_vertex)
+            let (start_vertex, apr) = self.start_vertex();
+            if let Some(apr) = apr {
+                self.expander(&apr, start_vertex)
+            } else {
+                let apr = new_apr(&self.cur_graph);
+                self.expander(&apr, start_vertex)
+            }
         };
 
         Some(self.postprocess(&expander))
@@ -671,10 +714,12 @@ mod tests {
     #[quickcheck]
     fn random_graph(g: RandomGraph) {
         let g = &g.graph;
+        let mut size_v = 0;
         let spar = Sparsifier::new(g);
-        spar.for_each(|_| {
-            // no crash
+        spar.for_each(|vs| {
+            size_v += vs.vertex_size();
         });
+        assert_eq!(size_v, g.vertex_size());
     }
 
     #[derive(Debug, Clone)]
