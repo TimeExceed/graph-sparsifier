@@ -1,7 +1,7 @@
 [package]
 name = "graph-sparsifier"
-version = "0.1.0"
-edition = "2024"
+version = "0.1.1"
+edition = "2021"
 license-file = "LICENSE"
 description = """
 A graph sparsifier based on an approximated PageRank algorithm.
